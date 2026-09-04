@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import admin, monitor, driver, queue
+from app.routers import admin, monitor, driver, queue, lines, drivers
 
 app = FastAPI(
     title="Tuktuk Queue API",
@@ -11,9 +11,9 @@ app = FastAPI(
         "Flutter reads queue state and subscribes to realtime updates "
         "directly via Supabase; it calls this API only for the actions "
         "that need server-side rules enforced (join, reorder, overtake, "
-        "status changes, void)."
+        "status changes, void, and line/driver management)."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -28,6 +28,8 @@ app.include_router(admin.router)
 app.include_router(monitor.router)
 app.include_router(driver.router)
 app.include_router(queue.router)
+app.include_router(lines.router)
+app.include_router(drivers.router)
 
 
 @app.get("/health")

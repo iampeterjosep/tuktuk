@@ -56,3 +56,38 @@ class DriverSearchResult(BaseModel):
     status: QueueStatus
     position_in_line: int
     total_in_line: int
+
+
+# ---- Line management (admin CRUD) ----
+
+
+class LineCreateRequest(BaseModel):
+    station_id: str
+    line_number: int = Field(..., gt=0)
+
+
+class LineUpdateRequest(BaseModel):
+    line_number: Optional[int] = Field(None, gt=0)
+    is_active: Optional[bool] = None
+
+
+class LineResponse(BaseModel):
+    id: str
+    station_id: str
+    line_number: int
+    is_active: bool
+
+
+# ---- Driver management (admin CRUD) ----
+
+
+class DriverUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class DriverResponse(BaseModel):
+    id: str
+    plate_number: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
