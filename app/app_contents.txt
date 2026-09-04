@@ -1,0 +1,909 @@
+==================================================
+FILE: ./config.py
+==================================================
+from typing import Optional
+
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    supabase_url: str
+    supabase_service_role_key: str
+    # No longer used for verification (Supabase signs tokens with ES256 via
+    # JWKS now, see dependencies.py), kept optional so old .env files with
+    # this key set don't break startup.
+    supabase_jwt_secret: Optional[str] = None
+    allowed_origins: str = "*"
+
+    class Config:
+        env_file = ".env"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        if self.allowed_origins == "*":
+            return ["*"]
+        return [o.strip() for o in self.allowed_origins.split(",")]
+
+
+settings = Settings()
+
+
+==================================================
+FILE: ./dependencies.py
+==================================================
+import time
+
+import httpx
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
+
+from app.config import settings
+from app.services.supabase_client import get_supabase
+
+bearer_scheme = HTTPBearer()
+
+# Supabase's public signing keys live here. Cached in-memory and refreshed
+# only when we hit a `kid` we don't recognise (e.g. after key rotation),
+# so normal requests don't do a network round trip on every call.
+JWKS_URL = f"{settings.supabase_url}/auth/v1/.well-known/jwks.json"
+_jwks_cache: dict = {"keys": [], "fetched_at": 0.0}
+_JWKS_CACHE_TTL_SECONDS = 3600
+
+
+class CurrentUser:
+    def __init__(self, id: str, role: str):
+        self.id = id
+        self.role = role
+
+
+def _fetch_jwks() -> dict:
+    resp = httpx.get(JWKS_URL, timeout=5.0)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_signing_key(kid: str) -> dict:
+    now = time.time()
+    stale = (now - _jwks_cache["fetched_at"]) > _JWKS_CACHE_TTL_SECONDS
+
+    if not _jwks_cache["keys"] or stale:
+        _jwks_cache.update(_fetch_jwks())
+        _jwks_cache["fetched_at"] = now
+
+    for key in _jwks_cache["keys"]:
+        if key.get("kid") == kid:
+            return key
+
+    # kid not found even after a fresh fetch attempt above - try one
+    # forced refresh in case keys just rotated, then give up.
+    _jwks_cache.update(_fetch_jwks())
+    _jwks_cache["fetched_at"] = time.time()
+    for key in _jwks_cache["keys"]:
+        if key.get("kid") == kid:
+            return key
+
+    raise JWTError(f"No matching signing key found for kid={kid}")
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> CurrentUser:
+    """
+    Validates the Supabase-issued JWT that Flutter sends after admin/monitor
+    login (via supabase_flutter's session.access_token), then looks up the
+    user's role from the profiles table.
+
+    Supabase signs these tokens asymmetrically (ES256), so verification uses
+    the project's public JWKS rather than a shared HS256 secret.
+
+    Driver-facing endpoints do NOT use this dependency - driver search is
+    public/anonymous by design (see routers/driver.py).
+    """
+    token = credentials.credentials
+    try:
+        unverified_header = jwt.get_unverified_header(token)
+        kid = unverified_header.get("kid")
+        if not kid:
+            raise JWTError("Token header missing kid")
+
+        signing_key = _get_signing_key(kid)
+
+        payload = jwt.decode(
+            token,
+            signing_key,
+            algorithms=[signing_key.get("alg", "ES256")],
+            audience="authenticated",
+        )
+    except (JWTError, httpx.HTTPError) as exc:
+        print("TOKEN VERIFY FAILED:", repr(exc))  # TEMP DEBUG
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        ) from exc
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token missing subject")
+
+    supabase = get_supabase()
+    result = (
+        supabase.table("profiles")
+        .select("id, role")
+        .eq("id", user_id)
+        .single()
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=403, detail="No profile found for user")
+
+    return CurrentUser(id=result.data["id"], role=result.data["role"])
+
+
+def require_role(*allowed_roles: str):
+    """Usage: Depends(require_role('admin')) or Depends(require_role('admin', 'monitor'))"""
+
+    def checker(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+        if user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires role: {' or '.join(allowed_roles)}",
+            )
+        return user
+
+    return checker
+
+
+==================================================
+FILE: ./__init__.py
+==================================================
+
+
+==================================================
+FILE: ./main.py
+==================================================
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.routers import admin, monitor, driver, queue, lines, drivers
+
+app = FastAPI(
+    title="Tuktuk Queue API",
+    description=(
+        "Privileged business-logic layer sitting alongside Supabase. "
+        "Flutter reads queue state and subscribes to realtime updates "
+        "directly via Supabase; it calls this API only for the actions "
+        "that need server-side rules enforced (join, reorder, overtake, "
+        "status changes, void, and line/driver management)."
+    ),
+    version="1.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(admin.router)
+app.include_router(monitor.router)
+app.include_router(driver.router)
+app.include_router(queue.router)
+app.include_router(lines.router)
+app.include_router(drivers.router)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+==================================================
+FILE: ./models.py
+==================================================
+from enum import Enum
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+class QueueStatus(str, Enum):
+    waiting = "waiting"
+    loading = "loading"
+    completed = "completed"
+    not_ready = "not_ready"
+    void = "void"
+
+
+class JoinQueueRequest(BaseModel):
+    line_id: str
+    plate_number: str = Field(..., min_length=2)
+    driver_name: Optional[str] = None
+    driver_phone: Optional[str] = None
+
+
+class JoinQueueResponse(BaseModel):
+    queue_entry_id: str
+    driver_id: str
+    line_id: str
+    position: float
+    status: QueueStatus
+
+
+class UpdateStatusRequest(BaseModel):
+    status: QueueStatus
+
+
+class ReorderItem(BaseModel):
+    queue_entry_id: str
+    position: float
+
+
+class ReorderRequest(BaseModel):
+    line_id: str
+    items: list[ReorderItem]
+
+
+class OvertakeRequest(BaseModel):
+    queue_entry_id: str
+
+
+class VoidRequest(BaseModel):
+    queue_entry_id: str
+    note: Optional[str] = None
+
+
+class DriverSearchResult(BaseModel):
+    plate_number: str
+    driver_name: Optional[str]
+    line_number: int
+    status: QueueStatus
+    position_in_line: int
+    total_in_line: int
+
+
+# ---- Line management (admin CRUD) ----
+
+
+class LineCreateRequest(BaseModel):
+    station_id: str
+    line_number: int = Field(..., gt=0)
+
+
+class LineUpdateRequest(BaseModel):
+    line_number: Optional[int] = Field(None, gt=0)
+    is_active: Optional[bool] = None
+
+
+class LineResponse(BaseModel):
+    id: str
+    station_id: str
+    line_number: int
+    is_active: bool
+
+
+# ---- Driver management (admin CRUD) ----
+
+
+class DriverUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class DriverResponse(BaseModel):
+    id: str
+    plate_number: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+
+
+==================================================
+FILE: ./routers/admin.py
+==================================================
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.dependencies import require_role, CurrentUser
+from app.services.supabase_client import get_supabase
+from app.models import (
+    JoinQueueRequest,
+    JoinQueueResponse,
+    ReorderRequest,
+    VoidRequest,
+)
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+@router.post("/queue/join", response_model=JoinQueueResponse)
+def join_queue(
+    payload: JoinQueueRequest,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """
+    Registers a tuktuk into a line when it enters the station lot.
+    Creates the driver record if the plate isn't known yet, then
+    appends them to the back of the chosen line.
+    """
+    supabase = get_supabase()
+
+    # 1. Find or create the driver by plate number
+    # NOTE: supabase-py's .maybe_single().execute() returns None outright
+    # (not a response object with data=None) when zero rows match - guard
+    # against that here rather than assuming a response object always comes back.
+    existing = (
+        supabase.table("drivers")
+        .select("id")
+        .eq("plate_number", payload.plate_number)
+        .maybe_single()
+        .execute()
+    )
+    existing_data = existing.data if existing is not None else None
+
+    if existing_data:
+        driver_id = existing_data["id"]
+    else:
+        created = (
+            supabase.table("drivers")
+            .insert(
+                {
+                    "plate_number": payload.plate_number,
+                    "name": payload.driver_name,
+                    "phone": payload.driver_phone,
+                }
+            )
+            .execute()
+        )
+        driver_id = created.data[0]["id"]
+
+    # 2. Reject if this driver already has an active queue entry somewhere
+    active = (
+        supabase.table("queue_entries")
+        .select("id")
+        .eq("driver_id", driver_id)
+        .in_("status", ["waiting", "loading", "not_ready"])
+        .execute()
+    )
+    if active.data:
+        raise HTTPException(
+            status_code=409,
+            detail="This driver already has an active queue entry",
+        )
+
+    # 3. Compute next position at the back of the chosen line
+    last = (
+        supabase.table("queue_entries")
+        .select("position")
+        .eq("line_id", payload.line_id)
+        .in_("status", ["waiting", "loading", "not_ready"])
+        .order("position", desc=True)
+        .limit(1)
+        .execute()
+    )
+    next_position = (last.data[0]["position"] + 1) if last.data else 1
+
+    entry = (
+        supabase.table("queue_entries")
+        .insert(
+            {
+                "line_id": payload.line_id,
+                "driver_id": driver_id,
+                "position": next_position,
+                "status": "waiting",
+                "updated_by": user.id,
+            }
+        )
+        .execute()
+    )
+    entry_row = entry.data[0]
+
+    supabase.table("audit_logs").insert(
+        {
+            "queue_entry_id": entry_row["id"],
+            "action": "joined",
+            "performed_by": user.id,
+            "to_status": "waiting",
+            "to_position": next_position,
+        }
+    ).execute()
+
+    return JoinQueueResponse(
+        queue_entry_id=entry_row["id"],
+        driver_id=driver_id,
+        line_id=payload.line_id,
+        position=next_position,
+        status="waiting",
+    )
+
+
+@router.post("/queue/reorder")
+def reorder_line(
+    payload: ReorderRequest,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """
+    Persists a new drag-and-drop order for a line. Flutter sends the full
+    list of entries in that line with their new position values; we update
+    each row and log every change that actually moved.
+    """
+    supabase = get_supabase()
+
+    # Fetch current positions so we only log genuine changes
+    current = (
+        supabase.table("queue_entries")
+        .select("id, position")
+        .eq("line_id", payload.line_id)
+        .execute()
+    )
+    current_positions = {row["id"]: row["position"] for row in current.data}
+
+    for item in payload.items:
+        old_position = current_positions.get(item.queue_entry_id)
+        if old_position == item.position:
+            continue  # no-op, skip write + log
+
+        supabase.table("queue_entries").update(
+            {"position": item.position, "updated_by": user.id}
+        ).eq("id", item.queue_entry_id).execute()
+
+        supabase.table("audit_logs").insert(
+            {
+                "queue_entry_id": item.queue_entry_id,
+                "action": "reordered",
+                "performed_by": user.id,
+                "from_position": old_position,
+                "to_position": item.position,
+            }
+        ).execute()
+
+    return {"detail": "Line reordered", "line_id": payload.line_id}
+
+
+@router.post("/queue/void")
+def void_entry(
+    payload: VoidRequest,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """Removes a driver from the queue entirely (left / no-show)."""
+    supabase = get_supabase()
+
+    existing = (
+        supabase.table("queue_entries")
+        .select("status")
+        .eq("id", payload.queue_entry_id)
+        .single()
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Queue entry not found")
+
+    old_status = existing.data["status"]
+
+    supabase.table("queue_entries").update(
+        {"status": "void", "updated_by": user.id}
+    ).eq("id", payload.queue_entry_id).execute()
+
+    supabase.table("audit_logs").insert(
+        {
+            "queue_entry_id": payload.queue_entry_id,
+            "action": "voided",
+            "performed_by": user.id,
+            "from_status": old_status,
+            "to_status": "void",
+            "note": payload.note,
+        }
+    ).execute()
+
+    return {"detail": "Entry voided"}
+
+
+==================================================
+FILE: ./routers/driver.py
+==================================================
+from fastapi import APIRouter, HTTPException
+
+from app.services.supabase_client import get_supabase
+from app.models import DriverSearchResult
+
+router = APIRouter(prefix="/driver", tags=["driver"])
+
+
+@router.get("/search/{plate_number}", response_model=DriverSearchResult)
+def search_by_plate(plate_number: str):
+    """
+    Public endpoint - no login. A driver types their plate and sees only
+    their own line number and how far up the queue they are. They cannot
+    see other drivers' names/phones, so this endpoint returns a narrow,
+    purpose-built shape rather than raw queue_entries rows.
+    """
+    supabase = get_supabase()
+
+    # NOTE: supabase-py's .maybe_single().execute() returns None outright
+    # (not a response object with data=None) when zero rows match - guard
+    # against that here rather than assuming a response object always comes back.
+    driver = (
+        supabase.table("drivers")
+        .select("id, name")
+        .eq("plate_number", plate_number)
+        .maybe_single()
+        .execute()
+    )
+    driver_data = driver.data if driver is not None else None
+    if not driver_data:
+        raise HTTPException(status_code=404, detail="Plate number not found")
+
+    entry = (
+        supabase.table("queue_entries")
+        .select("id, line_id, status, position, lines(line_number)")
+        .eq("driver_id", driver_data["id"])
+        .in_("status", ["waiting", "loading", "not_ready"])
+        .maybe_single()
+        .execute()
+    )
+    entry_data = entry.data if entry is not None else None
+    if not entry_data:
+        raise HTTPException(
+            status_code=404, detail="This driver is not currently in a queue"
+        )
+
+    line_id = entry_data["line_id"]
+    my_position = entry_data["position"]
+
+    # Everyone ahead of this driver (lower position) still active in the line
+    same_line = (
+        supabase.table("queue_entries")
+        .select("position")
+        .eq("line_id", line_id)
+        .in_("status", ["waiting", "loading", "not_ready"])
+        .execute()
+    )
+    ahead_or_equal = sorted(row["position"] for row in same_line.data)
+    position_in_line = ahead_or_equal.index(my_position) + 1
+    total_in_line = len(ahead_or_equal)
+
+    return DriverSearchResult(
+        plate_number=plate_number,
+        driver_name=driver_data.get("name"),
+        line_number=entry_data["lines"]["line_number"],
+        status=entry_data["status"],
+        position_in_line=position_in_line,
+        total_in_line=total_in_line,
+    )
+
+
+==================================================
+FILE: ./routers/drivers.py
+==================================================
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.dependencies import require_role, CurrentUser
+from app.services.supabase_client import get_supabase
+from app.models import DriverUpdateRequest, DriverResponse
+
+router = APIRouter(prefix="/admin/drivers", tags=["drivers"])
+
+
+@router.get("", response_model=list[DriverResponse])
+def list_drivers(
+    search: Optional[str] = None,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """
+    Lists drivers for the "Manage Drivers" screen, optionally filtered by
+    a plate-or-name search. Kept as a simple substring match (via
+    Postgres ILIKE through supabase-py's `.or_()`) since the driver table
+    is station-scale, not something that needs full-text search.
+    """
+    supabase = get_supabase()
+    query = supabase.table("drivers").select("id, plate_number, name, phone")
+
+    if search:
+        pattern = f"%{search}%"
+        query = query.or_(f"plate_number.ilike.{pattern},name.ilike.{pattern}")
+
+    rows = query.order("plate_number").limit(200).execute()
+    return [DriverResponse(**row) for row in rows.data]
+
+
+@router.patch("/{driver_id}", response_model=DriverResponse)
+def update_driver(
+    driver_id: str,
+    payload: DriverUpdateRequest,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    supabase = get_supabase()
+
+    existing = (
+        supabase.table("drivers")
+        .select("id")
+        .eq("id", driver_id)
+        .maybe_single()
+        .execute()
+    )
+    existing_data = existing.data if existing is not None else None
+    if not existing_data:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    update_fields = payload.model_dump(exclude_none=True)
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    updated = (
+        supabase.table("drivers").update(update_fields).eq("id", driver_id).execute()
+    )
+    return DriverResponse(**updated.data[0])
+
+
+@router.delete("/{driver_id}")
+def delete_driver(
+    driver_id: str,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """
+    Deletes a driver record. Blocked if they currently have an active
+    queue entry, so admins can't accidentally erase someone who's
+    actively waiting in line.
+    """
+    supabase = get_supabase()
+
+    active = (
+        supabase.table("queue_entries")
+        .select("id")
+        .eq("driver_id", driver_id)
+        .in_("status", ["waiting", "loading", "not_ready"])
+        .execute()
+    )
+    if active.data:
+        raise HTTPException(
+            status_code=409,
+            detail="This driver is currently in a queue - remove them from the line first",
+        )
+
+    supabase.table("drivers").delete().eq("id", driver_id).execute()
+    return {"detail": "Driver deleted"}
+
+
+==================================================
+FILE: ./routers/__init__.py
+==================================================
+
+
+==================================================
+FILE: ./routers/lines.py
+==================================================
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.dependencies import require_role, CurrentUser
+from app.services.supabase_client import get_supabase
+from app.models import LineCreateRequest, LineUpdateRequest, LineResponse
+
+router = APIRouter(prefix="/admin/lines", tags=["lines"])
+
+
+@router.get("", response_model=list[LineResponse])
+def list_lines(
+    station_id: str,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """
+    Lists every line for a station, active and inactive, for the "Manage
+    Lines" screen. (The public/realtime read Flutter uses for the queue
+    tabs only ever sees active lines - this is the admin-only view that
+    also surfaces closed ones so they can be reopened.)
+    """
+    supabase = get_supabase()
+    rows = (
+        supabase.table("lines")
+        .select("id, station_id, line_number, is_active")
+        .eq("station_id", station_id)
+        .order("line_number")
+        .execute()
+    )
+    return [LineResponse(**row) for row in rows.data]
+
+
+@router.post("", response_model=LineResponse)
+def create_line(
+    payload: LineCreateRequest,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    supabase = get_supabase()
+
+    existing = (
+        supabase.table("lines")
+        .select("id")
+        .eq("station_id", payload.station_id)
+        .eq("line_number", payload.line_number)
+        .maybe_single()
+        .execute()
+    )
+    existing_data = existing.data if existing is not None else None
+    if existing_data:
+        raise HTTPException(
+            status_code=409, detail="A line with that number already exists"
+        )
+
+    created = (
+        supabase.table("lines")
+        .insert(
+            {
+                "station_id": payload.station_id,
+                "line_number": payload.line_number,
+                "is_active": True,
+            }
+        )
+        .execute()
+    )
+    return LineResponse(**created.data[0])
+
+
+@router.patch("/{line_id}", response_model=LineResponse)
+def update_line(
+    line_id: str,
+    payload: LineUpdateRequest,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    supabase = get_supabase()
+
+    existing = (
+        supabase.table("lines").select("id").eq("id", line_id).maybe_single().execute()
+    )
+    existing_data = existing.data if existing is not None else None
+    if not existing_data:
+        raise HTTPException(status_code=404, detail="Line not found")
+
+    update_fields = payload.model_dump(exclude_none=True)
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    updated = (
+        supabase.table("lines").update(update_fields).eq("id", line_id).execute()
+    )
+    return LineResponse(**updated.data[0])
+
+
+@router.delete("/{line_id}")
+def delete_line(
+    line_id: str,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """
+    Deletes a line outright. Blocked if any tuktuk currently sits in it
+    (waiting/loading/not_ready) - a beginner-friendly admin should never
+    be able to accidentally erase a driver's spot in the queue.
+    """
+    supabase = get_supabase()
+
+    active = (
+        supabase.table("queue_entries")
+        .select("id")
+        .eq("line_id", line_id)
+        .in_("status", ["waiting", "loading", "not_ready"])
+        .execute()
+    )
+    if active.data:
+        raise HTTPException(
+            status_code=409,
+            detail="This line still has tuktuks in it - clear the line first",
+        )
+
+    supabase.table("lines").delete().eq("id", line_id).execute()
+    return {"detail": "Line deleted"}
+
+
+==================================================
+FILE: ./routers/monitor.py
+==================================================
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.dependencies import require_role, CurrentUser
+from app.services.supabase_client import get_supabase
+from app.models import UpdateStatusRequest
+
+router = APIRouter(prefix="/monitor", tags=["monitor"])
+
+
+@router.patch("/queue/{queue_entry_id}/status")
+def update_status(
+    queue_entry_id: str,
+    payload: UpdateStatusRequest,
+    user: CurrentUser = Depends(require_role("monitor", "admin")),
+):
+    """
+    Monitors use this to flip a tuktuk's status as it fills with passengers
+    (waiting -> loading -> completed). Position/line are never touched here -
+    the database itself (guard_monitor_update trigger) would reject it even
+    if this endpoint tried, but we also just never send it.
+    """
+    supabase = get_supabase()
+
+    existing = (
+        supabase.table("queue_entries")
+        .select("status")
+        .eq("id", queue_entry_id)
+        .single()
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Queue entry not found")
+
+    old_status = existing.data["status"]
+
+    supabase.table("queue_entries").update(
+        {"status": payload.status.value, "updated_by": user.id}
+    ).eq("id", queue_entry_id).execute()
+
+    supabase.table("audit_logs").insert(
+        {
+            "queue_entry_id": queue_entry_id,
+            "action": "status_changed",
+            "performed_by": user.id,
+            "from_status": old_status,
+            "to_status": payload.status.value,
+        }
+    ).execute()
+
+    return {"detail": "Status updated", "status": payload.status.value}
+
+
+==================================================
+FILE: ./routers/queue.py
+==================================================
+from fastapi import APIRouter, Depends
+
+from app.dependencies import require_role, CurrentUser
+from app.services.supabase_client import get_supabase
+from app.models import OvertakeRequest
+
+router = APIRouter(prefix="/queue", tags=["queue"])
+
+
+@router.post("/overtake")
+def overtake(
+    payload: OvertakeRequest,
+    user: CurrentUser = Depends(require_role("admin", "monitor")),
+):
+    """
+    Called when a driver in line isn't ready to carry passengers yet.
+    Marks them 'not_ready' and moves them to the back of their own line,
+    giving everyone behind them the privilege to move up. This calls the
+    overtake_driver() Postgres function (see tuktuk_schema.sql) so the
+    "find max position, reassign, log" sequence happens atomically in
+    the database rather than as separate round trips from here.
+    """
+    supabase = get_supabase()
+    supabase.rpc(
+        "overtake_driver",
+        {"p_queue_entry_id": payload.queue_entry_id, "p_actor": user.id},
+    ).execute()
+
+    return {"detail": "Driver marked not ready and moved to back of line"}
+
+
+==================================================
+FILE: ./services/__init__.py
+==================================================
+
+
+==================================================
+FILE: ./services/supabase_client.py
+==================================================
+from functools import lru_cache
+from supabase import create_client, Client
+from app.config import settings
+
+
+@lru_cache
+def get_supabase() -> Client:
+    """
+    Server-side Supabase client using the SERVICE ROLE key.
+    This bypasses Row Level Security entirely - only ever used
+    from within FastAPI (never exposed to Flutter), and only for
+    the specific privileged operations this backend is trusted with.
+    """
+    return create_client(settings.supabase_url, settings.supabase_service_role_key)
+
+

@@ -10,15 +10,13 @@ router = APIRouter(prefix="/driver", tags=["driver"])
 def search_by_plate(plate_number: str):
     """
     Public endpoint - no login. A driver types their plate and sees only
-    their own line number and how far up the queue they are. They cannot
-    see other drivers' names/phones, so this endpoint returns a narrow,
-    purpose-built shape rather than raw queue_entries rows.
+    their own line number, how far up the queue they are, and how many
+    vehicles are still ahead of them. They cannot see other drivers'
+    names/phones, so this returns a narrow, purpose-built shape rather
+    than raw queue_entries rows.
     """
     supabase = get_supabase()
 
-    # NOTE: supabase-py's .maybe_single().execute() returns None outright
-    # (not a response object with data=None) when zero rows match - guard
-    # against that here rather than assuming a response object always comes back.
     driver = (
         supabase.table("drivers")
         .select("id, name")
@@ -47,7 +45,6 @@ def search_by_plate(plate_number: str):
     line_id = entry_data["line_id"]
     my_position = entry_data["position"]
 
-    # Everyone ahead of this driver (lower position) still active in the line
     same_line = (
         supabase.table("queue_entries")
         .select("position")
@@ -66,4 +63,5 @@ def search_by_plate(plate_number: str):
         status=entry_data["status"],
         position_in_line=position_in_line,
         total_in_line=total_in_line,
+        vehicles_ahead=position_in_line - 1,
     )

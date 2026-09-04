@@ -44,6 +44,16 @@ class OvertakeRequest(BaseModel):
     queue_entry_id: str
 
 
+class ReinstateRequest(BaseModel):
+    queue_entry_id: str
+
+
+class MoveLineRequest(BaseModel):
+    queue_entry_id: str
+    target_line_id: str
+    target_position: float
+
+
 class VoidRequest(BaseModel):
     queue_entry_id: str
     note: Optional[str] = None
@@ -56,6 +66,7 @@ class DriverSearchResult(BaseModel):
     status: QueueStatus
     position_in_line: int
     total_in_line: int
+    vehicles_ahead: int
 
 
 # ---- Line management (admin CRUD) ----

@@ -6,6 +6,7 @@ from app.models import (
     JoinQueueRequest,
     JoinQueueResponse,
     ReorderRequest,
+    MoveLineRequest,
     VoidRequest,
 )
 
@@ -25,9 +26,6 @@ def join_queue(
     supabase = get_supabase()
 
     # 1. Find or create the driver by plate number
-    # NOTE: supabase-py's .maybe_single().execute() returns None outright
-    # (not a response object with data=None) when zero rows match - guard
-    # against that here rather than assuming a response object always comes back.
     existing = (
         supabase.table("drivers")
         .select("id")
@@ -125,7 +123,6 @@ def reorder_line(
     """
     supabase = get_supabase()
 
-    # Fetch current positions so we only log genuine changes
     current = (
         supabase.table("queue_entries")
         .select("id, position")
@@ -137,7 +134,7 @@ def reorder_line(
     for item in payload.items:
         old_position = current_positions.get(item.queue_entry_id)
         if old_position == item.position:
-            continue  # no-op, skip write + log
+            continue
 
         supabase.table("queue_entries").update(
             {"position": item.position, "updated_by": user.id}
@@ -154,6 +151,61 @@ def reorder_line(
         ).execute()
 
     return {"detail": "Line reordered", "line_id": payload.line_id}
+
+
+@router.post("/queue/move")
+def move_line(
+    payload: MoveLineRequest,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """
+    Reassigns a tuktuk from its current line to a different one - this is
+    what powers dragging a card between line columns on the admin board.
+    Only touches this entry; the Flutter client follows up with a
+    /admin/queue/reorder call for the affected line(s) to keep positions
+    a clean 1..n sequence.
+    """
+    supabase = get_supabase()
+
+    existing = (
+        supabase.table("queue_entries")
+        .select("line_id, position, status")
+        .eq("id", payload.queue_entry_id)
+        .maybe_single()
+        .execute()
+    )
+    existing_data = existing.data if existing is not None else None
+    if not existing_data:
+        raise HTTPException(status_code=404, detail="Queue entry not found")
+
+    if existing_data["status"] not in ("waiting", "loading", "not_ready"):
+        raise HTTPException(
+            status_code=409, detail="Only active entries can be moved between lines"
+        )
+
+    old_line_id = existing_data["line_id"]
+    old_position = existing_data["position"]
+
+    supabase.table("queue_entries").update(
+        {
+            "line_id": payload.target_line_id,
+            "position": payload.target_position,
+            "updated_by": user.id,
+        }
+    ).eq("id", payload.queue_entry_id).execute()
+
+    supabase.table("audit_logs").insert(
+        {
+            "queue_entry_id": payload.queue_entry_id,
+            "action": "moved_line",
+            "performed_by": user.id,
+            "from_position": old_position,
+            "to_position": payload.target_position,
+            "note": f"Moved from line {old_line_id} to {payload.target_line_id}",
+        }
+    ).execute()
+
+    return {"detail": "Entry moved to new line"}
 
 
 @router.post("/queue/void")
