@@ -67,6 +67,11 @@ class DriverSearchResult(BaseModel):
     position_in_line: int
     total_in_line: int
     vehicles_ahead: int
+    # Plate of the single tuktuk directly ahead in the same line - null
+    # when this driver is already at the front (vehicles_ahead == 0).
+    # Deliberately just the one plate, not the full list ahead, per
+    # product decision to keep this screen simple for drivers.
+    vehicle_ahead_plate: Optional[str] = None
 
 
 # ---- Line management (admin CRUD) ----
@@ -98,6 +103,21 @@ class DriverUpdateRequest(BaseModel):
 
 
 class DriverResponse(BaseModel):
+    id: str
+    plate_number: str
+    name: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class DriverLookupResponse(BaseModel):
+    """
+    Returned by GET /admin/drivers/lookup/{plate_number}, used by the
+    "Register Tuktuk" dialog to prefill name/phone for a plate we've
+    already seen before, so staff aren't retyping details for regulars.
+    A 404 (not a 200 with nulled-out fields) means the plate is new -
+    that distinction matters to the Flutter client.
+    """
+
     id: str
     plate_number: str
     name: Optional[str] = None

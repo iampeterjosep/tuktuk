@@ -10,7 +10,10 @@ router = APIRouter(prefix="/queue", tags=["queue"])
 @router.post("/overtake")
 def overtake(
     payload: OvertakeRequest,
-    user: CurrentUser = Depends(require_role("admin", "monitor")),
+    # Admin-only: line composition (who's in a line, and in what order)
+    # is an admin responsibility. Monitors only advance ride status
+    # (waiting -> loading -> completed) via routers/monitor.py.
+    user: CurrentUser = Depends(require_role("admin")),
 ):
     """
     Called when a driver in line isn't ready to carry passengers yet.
@@ -32,7 +35,8 @@ def overtake(
 @router.post("/reinstate")
 def reinstate(
     payload: ReinstateRequest,
-    user: CurrentUser = Depends(require_role("admin", "monitor")),
+    # Admin-only - see note on overtake() above.
+    user: CurrentUser = Depends(require_role("admin")),
 ):
     """
     Brings a 'not_ready' tuktuk back into active rotation once it's ready

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.dependencies import require_role, CurrentUser
 from app.services.supabase_client import get_supabase
-from app.models import DriverUpdateRequest, DriverResponse
+from app.models import DriverUpdateRequest, DriverResponse, DriverLookupResponse
 
 router = APIRouter(prefix="/admin/drivers", tags=["drivers"])
 
@@ -29,6 +29,39 @@ def list_drivers(
 
     rows = query.order("plate_number").limit(200).execute()
     return [DriverResponse(**row) for row in rows.data]
+
+
+@router.get("/lookup/{plate_number}", response_model=DriverLookupResponse)
+def lookup_driver(
+    plate_number: str,
+    user: CurrentUser = Depends(require_role("admin")),
+):
+    """
+    Used by the "Register Tuktuk" dialog: as staff type a plate number,
+    the client calls this to check whether we already know this driver.
+    If we do, name/phone are prefilled automatically so staff aren't
+    retyping contact details every time a regular comes back for another
+    ride - the same driver row is reused (see join_queue's find-or-create
+    logic in routers/admin.py), only a new queue_entries ride record is
+    created.
+
+    Returns a plain 404 (not a 200 with a null body) for an unknown
+    plate, so the client can distinguish "new driver, nothing to
+    prefill" from "known driver with blank contact fields" without
+    special-casing an empty response body.
+    """
+    supabase = get_supabase()
+    result = (
+        supabase.table("drivers")
+        .select("id, plate_number, name, phone")
+        .eq("plate_number", plate_number)
+        .maybe_single()
+        .execute()
+    )
+    data = result.data if result is not None else None
+    if not data:
+        raise HTTPException(status_code=404, detail="Plate number not known yet")
+    return DriverLookupResponse(**data)
 
 
 @router.patch("/{driver_id}", response_model=DriverResponse)
