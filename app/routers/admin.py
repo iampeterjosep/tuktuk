@@ -164,6 +164,16 @@ def move_line(
     Only touches this entry; the Flutter client follows up with a
     /admin/queue/reorder call for the affected line(s) to keep positions
     a clean 1..n sequence.
+
+    NOTE: the queue_entries update below is committed to Postgres BEFORE
+    the audit_logs insert runs. If the audit_logs insert fails (e.g. the
+    "moved_line" value wasn't yet defined on the audit_action enum - see
+    migration_add_moved_line_enum.sql), this endpoint still returns a
+    500, but the entry has *already* moved to the new line. The Flutter
+    side needs to treat a 500 here as "maybe partially applied" and
+    resync rather than assuming nothing happened - see
+    moveEntryAcrossLines() in queue_move_utils.dart, which now
+    invalidates both line providers after a move regardless of outcome.
     """
     supabase = get_supabase()
 
